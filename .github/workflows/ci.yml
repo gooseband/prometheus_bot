@@ -11,6 +11,10 @@ on:
         options:
           - production
           - staging
+      version:
+        description: 'Version number (e.g., 1.0.0)'
+        required: true
+        type: string
 
 jobs:
   deploy:
@@ -31,12 +35,12 @@ jobs:
         run: |
           echo IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]') >> $GITHUB_ENV
 
-      - name: Set image tag based on environment
+      - name: Set image tags based on environment
         run: |
           if [[ "${{ inputs.environment }}" == "staging" ]]; then
-            echo IMAGE_TAG=staging >> $GITHUB_ENV
+            echo IMAGE_TAGS=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }}-staging >> $GITHUB_ENV
           else
-            echo IMAGE_TAG=latest >> $GITHUB_ENV
+            echo IMAGE_TAGS=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ inputs.version }} >> $GITHUB_ENV
           fi
 
       - name: Log in to the Container registry
@@ -58,7 +62,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          tags: ${{ env.IMAGE_TAGS }}
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Generate artifact attestation
