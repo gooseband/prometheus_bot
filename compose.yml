@@ -10,6 +10,9 @@ services:
     ports:
       - "9087:9087"
     restart: unless-stopped
+    volumes:
+      - ./config.yaml:/config.yaml
+      - ./template.yaml:/template.yaml
     # Uncomment to enable debug mode
     # command: ["-d"]
 
