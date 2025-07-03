@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"sort"
@@ -57,6 +59,25 @@ type Config struct {
 	SplitMessageBytes   int    `yaml:"split_msg_byte"`
 	SendOnly            bool   `yaml:"send_only"`
 	DisableNotification bool   `yaml:"disable_notification"`
+	LogLevel            string `yaml:"log_level"`
+	// New button configuration
+	DefaultButtonName string `yaml:"default_button_name"`
+	DefaultButtonURL  string `yaml:"default_button_url"`
+	Buttons           struct {
+		AlertButtons []struct {
+			Key          string `yaml:"key"`
+			TextTemplate string `yaml:"text_template"`
+			URLTemplate  string `yaml:"url_template"`
+		} `yaml:"alert_buttons"`
+		MaxButtonsPerRow int `yaml:"max_buttons_per_row"`
+		MaxTotalButtons  int `yaml:"max_total_buttons"`
+	} `yaml:"buttons"`
+}
+
+type ButtonData struct {
+	Index int
+	Value string
+	Alert Alert
 }
 
 /**
@@ -114,6 +135,34 @@ func RoundPrec(x float64, prec int) float64 {
 	return rounder / pow * sign
 }
 
+// Add function for template addition
+func add(a, b int) int {
+	return a + b
+}
+
+func setupLogging(level string) {
+	var logLevel slog.Level
+
+	switch strings.ToUpper(level) {
+	case "DEBUG":
+		logLevel = slog.LevelDebug
+	case "INFO":
+		logLevel = slog.LevelInfo
+	case "WARN", "WARNING":
+		logLevel = slog.LevelWarn
+	case "ERROR":
+		logLevel = slog.LevelError
+	default:
+		logLevel = slog.LevelInfo // default to INFO if invalid level
+	}
+
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	})
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+}
+
 /******************************************************************************
  *
  *          Function for formatting template
@@ -131,7 +180,7 @@ func str_Format_MeasureUnit(MeasureUnit string, value string) string {
 	if len(SplittedMUnit) > 2 {
 		tmp, err := strconv.ParseInt(SplittedMUnit[2], 10, 8)
 		if err != nil {
-			log.Println("Could not convert value to int")
+			slog.Error("Could not convert value to int", "error", err)
 			if !*debug {
 				// If is running in production leave daemon live. else here will die with log error.
 				return "" // Break execution and return void string, bot will log somethink
@@ -314,6 +363,7 @@ var funcMap = template.FuncMap{
 	"str_Format_MeasureUnit": str_Format_MeasureUnit,
 	"HasKey":                 HasKey,
 	"contains":               strings.Contains,
+	"add":                    add,
 }
 
 func telegramBot(bot *tgbotapi.BotAPI) {
@@ -333,7 +383,7 @@ func telegramBot(bot *tgbotapi.BotAPI) {
 	for update := range updates {
 		if update.Message == nil {
 			if *debug {
-				log.Printf("[UNKNOWN_MESSAGE] [%v]", update)
+				slog.Debug("Unknown message", "update", update)
 			}
 			continue
 		}
@@ -357,10 +407,134 @@ func loadTemplate(tmplPath string) *template.Template {
 	if err != nil {
 		log.Fatalf("Problem reading parsing template file: %v", err)
 	} else {
-		log.Printf("Load template file:%s", tmplPath)
+		slog.Info("Load template file", "path", tmplPath)
 	}
 
 	return tmpH
+}
+
+func generateInlineKeyboard(alerts Alerts) *tgbotapi.InlineKeyboardMarkup {
+	var buttons [][]tgbotapi.InlineKeyboardButton
+	var currentRow []tgbotapi.InlineKeyboardButton
+	buttonCount := 0
+
+	// Add default button if configured
+	if cfg.DefaultButtonName != "" && cfg.DefaultButtonURL != "" {
+		if isValidURL(cfg.DefaultButtonURL) {
+			defaultBtn := tgbotapi.NewInlineKeyboardButtonURL(cfg.DefaultButtonName, cfg.DefaultButtonURL)
+			currentRow = append(currentRow, defaultBtn)
+			buttonCount++
+		}
+	}
+
+	// Generate buttons based on button config and alerts
+	urlsSeen := make(map[string]bool)
+
+	for i, alert := range alerts.Alerts {
+		if buttonCount >= cfg.Buttons.MaxTotalButtons {
+			break
+		}
+
+		// Process each button configuration
+		for _, btnConfig := range cfg.Buttons.AlertButtons {
+			if buttonCount >= cfg.Buttons.MaxTotalButtons {
+				break
+			}
+
+			var urlValue string
+			var found bool
+
+			// Check in labels first
+			if val, ok := alert.Labels[btnConfig.Key]; ok {
+				if strVal, ok := val.(string); ok {
+					urlValue = strVal
+					found = true
+				}
+			}
+
+			// Check in annotations if not found in labels
+			if !found {
+				if val, ok := alert.Annotations[btnConfig.Key]; ok {
+					if strVal, ok := val.(string); ok {
+						urlValue = strVal
+						found = true
+					}
+				}
+			}
+
+			// Special case for generatorURL
+			if !found && btnConfig.Key == "generatorURL" && alert.GeneratorURL != "" {
+				urlValue = alert.GeneratorURL
+				found = true
+			}
+
+			if found && isValidURL(urlValue) {
+         // Create unique key for deduplication that includes alert index and button type
+         uniqueKey := fmt.Sprintf("%s_%d_%s", urlValue, i, btnConfig.Key)
+
+         if !urlsSeen[uniqueKey] {
+         	urlsSeen[uniqueKey] = true
+
+         	// Generate button text using template
+         	buttonText := generateButtonText(btnConfig.TextTemplate, ButtonData{
+         		Index: i + 1,
+         		Value: urlValue,
+         		Alert: alert,
+         	})
+
+         	btn := tgbotapi.NewInlineKeyboardButtonURL(buttonText, urlValue)
+         	currentRow = append(currentRow, btn)
+         	buttonCount++
+
+         	// Check if we need to start a new row
+         	if len(currentRow) >= cfg.Buttons.MaxButtonsPerRow {
+         		buttons = append(buttons, currentRow)
+         		currentRow = []tgbotapi.InlineKeyboardButton{}
+         	}
+         }
+      }
+		}
+	}
+
+	// Add any remaining buttons in the current row
+	if len(currentRow) > 0 {
+		buttons = append(buttons, currentRow)
+	}
+
+	if len(buttons) == 0 {
+		return nil
+	}
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	return &keyboard
+}
+
+func generateButtonText(template string, data ButtonData) string {
+	// Simple template replacement
+	result := strings.ReplaceAll(template, "{{ .Index }}", strconv.Itoa(data.Index))
+	result = strings.ReplaceAll(result, "{{ .Value }}", data.Value)
+
+	// Add more template variables if needed
+	if alertName, ok := data.Alert.Labels["alertname"]; ok {
+		if alertNameStr, ok := alertName.(string); ok {
+			result = strings.ReplaceAll(result, "{{ .AlertName }}", alertNameStr)
+		}
+	}
+
+	return result
+}
+
+func isValidURL(urlString string) bool {
+	if urlString == "" {
+		return false
+	}
+
+	parsedURL, err := url.Parse(urlString)
+	if err != nil {
+		return false
+	}
+
+	return parsedURL.Scheme == "http" || parsedURL.Scheme == "https"
 }
 
 func SplitString(s string, n int) []string {
@@ -394,6 +568,22 @@ func main() {
 		log.Fatalf("Error parsing configuration file: %v", err)
 	}
 
+	// Set default log level if not specified
+	if cfg.LogLevel == "" {
+		cfg.LogLevel = "INFO"
+	}
+
+	// Setup logging based on configuration
+	setupLogging(cfg.LogLevel)
+
+	// Set default button values if not configured
+	if cfg.Buttons.MaxButtonsPerRow == 0 {
+		cfg.Buttons.MaxButtonsPerRow = 3
+	}
+	if cfg.Buttons.MaxTotalButtons == 0 {
+		cfg.Buttons.MaxTotalButtons = 10
+	}
+
 	if *template_path != "" {
 		cfg.TemplatePath = *template_path
 	}
@@ -423,8 +613,9 @@ func main() {
 		tmpH = nil
 	}
 	if !(*debug) {
-		gin.SetMode(gin.ReleaseMode)
-	}
+  	gin.SetMode(gin.ReleaseMode)
+  }
+  gin.DefaultWriter = io.Discard
 
 	for {
 		bot_tmp, err := tgbotapi.NewBotAPI(cfg.TelegramToken)
@@ -432,7 +623,7 @@ func main() {
 			bot = bot_tmp
 			break
 		} else {
-			log.Printf("Error initializing telegram connection: %s", err)
+			slog.Error("Error initializing telegram connection", "error", err)
 			time.Sleep(time.Second)
 		}
 	}
@@ -441,10 +632,10 @@ func main() {
 		bot.Debug = true
 	}
 
-	log.Printf("Authorised on account %s", bot.Self.UserName)
+	slog.Info("Authorised on account", "username", bot.Self.UserName)
 
 	if cfg.SendOnly {
-		log.Printf("Works in send_only mode")
+		slog.Info("Works in send_only mode")
 	} else {
 		go telegramBot(bot)
 	}
@@ -463,10 +654,10 @@ func main() {
 }
 
 func GET_Handling(c *gin.Context) {
-	log.Printf("Received GET")
+	slog.Info("Received GET")
 	topicid := getID(c, "topicid")
 	chatid := getID(c, "chatid")
-	log.Printf("Bot test: %d:%d", chatid, topicid)
+	slog.Info("Bot test", "chatid", chatid, "topicid", topicid)
 
 	msgtext := fmt.Sprintf("Some HTTP triggered notification by prometheus bot... %d:%d", chatid, topicid)
 	msg := tgbotapi.NewMessage(chatid, msgtext)
@@ -551,7 +742,7 @@ func AlertFormatTemplate(alerts Alerts) string {
 	writer := io.Writer(&bytesBuff)
 
 	if *debug {
-		log.Printf("Reloading Template\n")
+		slog.Debug("Reloading Template")
 		// reload template bacause we in debug mode
 		tmpH = loadTemplate(cfg.TemplatePath)
 	}
@@ -579,10 +770,10 @@ func SanitizeMsg(str string) string {
 	for {
 		_, err := d.Token()
 		if err == io.EOF {
-			log.Println("HTML is valid, sending it...")
+			slog.Debug("HTML is valid, sending it...")
 			break
 		} else if err != nil {
-			log.Println("HTML is not valid, strip all tags to prevent error")
+			slog.Warn("HTML is not valid, strip all tags to prevent error")
 			p := bluemonday.StrictPolicy()
 			str = p.Sanitize(str)
 			break
@@ -600,7 +791,7 @@ func getID(c *gin.Context, param string) int64 {
 	}
 	id, err := strconv.ParseInt(c.Param(param), 10, 64)
 	if err != nil {
-		log.Printf("Can't parse %s id: %q", param, c.Param(param))
+		slog.Error("Can't parse id", "param", param, "value", c.Param(param), "error", err)
 		c.JSON(http.StatusServiceUnavailable, gin.H{
 			"err": fmt.Sprint(err),
 		})
@@ -614,19 +805,17 @@ func POST_Handling(c *gin.Context) {
 
 	topicid := getID(c, "topicid")
 	chatid := getID(c, "chatid")
-	log.Printf("Bot alert post: chat %d, topic %d", chatid, topicid)
+	slog.Info("Bot alert post", "chatid", chatid, "topicid", topicid)
 
 	binding.JSON.Bind(c.Request, &alerts)
 
 	s, err := json.Marshal(alerts)
 	if err != nil {
-		log.Print(err)
+		slog.Error("Error marshaling alerts", "error", err)
 		return
 	}
 
-	log.Println("+------------------  A L E R T  J S O N  -------------------+")
-	log.Printf("%s", s)
-	log.Println("+-----------------------------------------------------------+")
+	slog.Debug("Alert JSON", "json", string(s))
 
 	// Decide how format Text
 	if cfg.TemplatePath == "" {
@@ -634,6 +823,10 @@ func POST_Handling(c *gin.Context) {
 	} else {
 		msgtext = AlertFormatTemplate(alerts)
 	}
+
+	// Generate inline keyboard
+	inlineKeyboard := generateInlineKeyboard(alerts)
+
 	for _, subString := range SplitString(msgtext, cfg.SplitMessageBytes) {
 
 		sanitizedString := SanitizeMsg(subString)
@@ -642,10 +835,13 @@ func POST_Handling(c *gin.Context) {
 		msg.ParseMode = tgbotapi.ModeHTML
 		msg.ReplyToMessageID = int(topicid)
 
+		// Add inline keyboard if we have buttons
+		if inlineKeyboard != nil {
+			msg.ReplyMarkup = inlineKeyboard
+		}
+
 		// Print in Log result message
-		log.Println("+---------------  F I N A L   M E S S A G E  ---------------+")
-		log.Println(subString)
-		log.Println("+-----------------------------------------------------------+")
+		slog.Debug("Final message", "message", subString)
 
 		msg.DisableWebPagePreview = true
 		if cfg.DisableNotification {
@@ -656,7 +852,7 @@ func POST_Handling(c *gin.Context) {
 		if err == nil {
 			c.String(http.StatusOK, "telegram msg sent.")
 		} else {
-			log.Printf("Error sending message: %s", err)
+			slog.Error("Error sending message", "error", err)
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"err":     fmt.Sprint(err),
 				"message": sendmsg,
