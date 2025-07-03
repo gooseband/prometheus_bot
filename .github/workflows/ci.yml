@@ -5,12 +5,33 @@ on:
   push:
     branches:
       - master
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      skip_tests:
+        description: 'Skip tests and linting'
+        required: false
+        default: false
+        type: boolean
+      force_deploy:
+        description: 'Force deployment even on non-master branch'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
 
   hadolint:
     name: Test dockerfile syntax
     runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
     steps:
       - name: Check out the codebase.
         uses: actions/checkout@main
@@ -28,6 +49,7 @@ jobs:
   build:
     name: Build and test docker
     runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_tests }}
     steps:
       - name: Check out the codebase.
         uses: actions/checkout@main
@@ -48,7 +70,7 @@ jobs:
         run: docker stop ${DOCKERCONTAINER} && docker rm -fv ${DOCKERCONTAINER}
 
   deploy:
-    if: ${{ github.ref == 'refs/heads/master' }}
+    if: ${{ github.ref == 'refs/heads/master' || inputs.force_deploy }}
     needs: [hadolint, build]
     name: Push to ghcr.io
     runs-on: ubuntu-latest
@@ -66,6 +88,14 @@ jobs:
       - name: Set IMAGE_NAME env as github_repository lower-case
         run: |
           echo IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]') >> $GITHUB_ENV
+
+      - name: Set image tag based on environment
+        run: |
+          if [[ "${{ inputs.environment }}" == "staging" ]]; then
+            echo IMAGE_TAG=staging >> $GITHUB_ENV
+          else
+            echo IMAGE_TAG=latest >> $GITHUB_ENV
+          fi
 
       - name: Log in to the Container registry
         uses: docker/login-action@master
@@ -86,7 +116,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
           labels: ${{ steps.meta.outputs.labels }}
 
       - name: Generate artifact attestation
